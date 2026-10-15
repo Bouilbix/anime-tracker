@@ -1,0 +1,942 @@
+<!DOCTYPE html>
+<html lang="fr" data-theme="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Anime Tracker</title>
+  <link rel="manifest" href="manifest.json">
+  <meta name="theme-color" content="#0d0f1a">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <link rel="apple-touch-icon" href="icon-192.png">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Nunito:wght@400;600;700;800;900&display=swap">
+
+  <!-- Firebase -->
+  <script type="module">
+    import { initializeApp } from "https://www.gstatic.com/firebasejs/11.0.1/firebase-app.js";
+    import { getAuth, GoogleAuthProvider, signInWithRedirect, getRedirectResult, signOut, onAuthStateChanged }
+      from "https://www.gstatic.com/firebasejs/11.0.1/firebase-auth.js";
+    import { getFirestore, collection, doc, setDoc, deleteDoc, onSnapshot, query, orderBy }
+      from "https://www.gstatic.com/firebasejs/11.0.1/firebase-firestore.js";
+
+    const firebaseConfig = {
+      apiKey: "AIzaSyBd9GMbrza4eSaEMVDUM1Ti4vcusSYWpTg",
+      authDomain: "anime-tracker-4709e.firebaseapp.com",
+      projectId: "anime-tracker-4709e",
+      storageBucket: "anime-tracker-4709e.firebasestorage.app",
+      messagingSenderId: "702302630032",
+      appId: "1:702302630032:web:c7a3777f6470645408e815"
+    };
+
+    const app = initializeApp(firebaseConfig);
+    const auth = getAuth(app);
+    const db = getFirestore(app);
+    const provider = new GoogleAuthProvider();
+
+    // ─── State ───────────────────────────────────────────────────────────────
+    let currentUser = null;
+    let animes = [];
+    let unsubscribe = null;
+    let acTimer = null;
+    let acAbort = null;
+    let activeTab = 'liste';
+    let editingId = null;
+    let filterStatus = 'all';
+    let sortBy = 'recent';
+
+    // ─── DOM refs ─────────────────────────────────────────────────────────────
+    const loginScreen   = document.getElementById('login-screen');
+    const appScreen     = document.getElementById('app-screen');
+    const loginBtn      = document.getElementById('login-btn');
+    const logoutBtn     = document.getElementById('logout-btn');
+    const userAvatar    = document.getElementById('user-avatar');
+    const userName      = document.getElementById('user-name');
+    const searchInput   = document.getElementById('search-input');
+    const acDropdown    = document.getElementById('ac-dropdown');
+    const animeGrid     = document.getElementById('anime-grid');
+    const emptyState    = document.getElementById('empty-state');
+    const modal         = document.getElementById('modal');
+    const modalTitle    = document.getElementById('modal-title');
+    const statsSection  = document.getElementById('stats-section');
+    const listeSection  = document.getElementById('liste-section');
+    const tabBtns       = document.querySelectorAll('.tab-btn');
+
+    // ─── Auth ─────────────────────────────────────────────────────────────────
+    // Handle redirect result on page load
+    getRedirectResult(auth).catch(err => console.error('Redirect error:', err));
+
+    loginBtn.addEventListener('click', () => signInWithRedirect(auth, provider));
+    logoutBtn.addEventListener('click', () => { signOut(auth); });
+
+    onAuthStateChanged(auth, user => {
+      currentUser = user;
+      if (user) {
+        loginScreen.hidden = true;
+        appScreen.hidden = false;
+        window.scrollTo(0, 0);
+        userAvatar.src = user.photoURL || '';
+        userAvatar.hidden = !user.photoURL;
+        userName.textContent = user.displayName?.split(' ')[0] || 'Toi';
+        subscribeAnimes();
+      } else {
+        loginScreen.hidden = false;
+        appScreen.hidden = true;
+        if (unsubscribe) { unsubscribe(); unsubscribe = null; }
+        animes = [];
+      }
+    });
+
+    // ─── Firestore realtime ───────────────────────────────────────────────────
+    function subscribeAnimes() {
+      if (unsubscribe) unsubscribe();
+      const q = query(
+        collection(db, 'users', currentUser.uid, 'animes'),
+        orderBy('addedAt', 'desc')
+      );
+      unsubscribe = onSnapshot(q, snap => {
+        animes = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+        renderGrid();
+        renderStats();
+      });
+    }
+
+    async function saveAnime(data) {
+      const id = data.id || crypto.randomUUID();
+      await setDoc(doc(db, 'users', currentUser.uid, 'animes', id), {
+        ...data,
+        id,
+        addedAt: data.addedAt || Date.now(),
+        updatedAt: Date.now(),
+      });
+    }
+
+    async function deleteAnime(id) {
+      await deleteDoc(doc(db, 'users', currentUser.uid, 'animes', id));
+    }
+
+    // ─── Tabs ─────────────────────────────────────────────────────────────────
+    tabBtns.forEach(btn => {
+      btn.addEventListener('click', () => {
+        activeTab = btn.dataset.tab;
+        tabBtns.forEach(b => b.classList.toggle('active', b === btn));
+        listeSection.hidden  = activeTab !== 'liste';
+        statsSection.hidden  = activeTab !== 'stats';
+      });
+    });
+
+    // ─── Filtres & tri ────────────────────────────────────────────────────────
+    document.getElementById('filter-status').addEventListener('change', e => {
+      filterStatus = e.target.value;
+      renderGrid();
+    });
+    document.getElementById('sort-by').addEventListener('change', e => {
+      sortBy = e.target.value;
+      renderGrid();
+    });
+
+    // ─── Recherche (Jikan API) ────────────────────────────────────────────────
+    searchInput.addEventListener('input', () => {
+      const q = searchInput.value.trim();
+      if (q.length < 2) { closeAC(); return; }
+      clearTimeout(acTimer);
+      acTimer = setTimeout(() => fetchAC(q), 350);
+    });
+    searchInput.addEventListener('blur', () => setTimeout(closeAC, 200));
+    searchInput.addEventListener('keydown', e => {
+      const items = acDropdown.querySelectorAll('.ac-item[data-idx]');
+      let focused = acDropdown.querySelector('.ac-item.focused');
+      if (e.key === 'ArrowDown') {
+        e.preventDefault();
+        const next = focused
+          ? (items[+focused.dataset.idx + 1] || items[0])
+          : items[0];
+        if (next) { focused?.classList.remove('focused'); next.classList.add('focused'); }
+      } else if (e.key === 'ArrowUp') {
+        e.preventDefault();
+        const prev = focused
+          ? (items[+focused.dataset.idx - 1] || items[items.length - 1])
+          : items[items.length - 1];
+        if (prev) { focused?.classList.remove('focused'); prev.classList.add('focused'); }
+      } else if (e.key === 'Enter') {
+        e.preventDefault();
+        if (focused) focused.click();
+      } else if (e.key === 'Escape') closeAC();
+    });
+
+    async function fetchAC(q) {
+      if (acAbort) acAbort.abort();
+      acAbort = new AbortController();
+      showACLoading();
+      try {
+        const url = `https://api.jikan.moe/v4/anime?q=${encodeURIComponent(q)}&limit=10&sfw=true&order_by=popularity&sort=asc`;
+        const res = await fetch(url, { signal: acAbort.signal });
+        if (!res.ok) throw new Error();
+        const { data } = await res.json();
+        renderAC(data || [], q);
+      } catch (e) {
+        if (e.name === 'AbortError') return;
+        renderAC([], q);
+      }
+    }
+
+    function showACLoading() {
+      acDropdown.innerHTML = `<div class="ac-loading">
+        <div class="spinner"></div> Recherche…
+      </div>`;
+      acDropdown.classList.add('open');
+    }
+
+    function renderAC(data, q) {
+      acDropdown.innerHTML = '';
+      const already = new Set(animes.map(a => a.title?.toLowerCase()));
+
+      data.forEach((a, i) => {
+        const title = a.title_english || a.title;
+        const img = a.images?.jpg?.small_image_url || '';
+        const eps = a.episodes ? `${a.episodes} ép.` : '? ép.';
+        const score = a.score ? `★ ${a.score}` : '';
+        const inLib = already.has(title.toLowerCase());
+
+        const div = document.createElement('div');
+        div.className = 'ac-item' + (inLib ? ' in-lib' : '');
+        div.dataset.idx = i;
+        div.innerHTML = `
+          ${img ? `<img src="${img}" alt="" class="ac-thumb">` : '<div class="ac-thumb-placeholder"></div>'}
+          <div class="ac-info">
+            <span class="ac-title">${highlight(title, q)}</span>
+            <span class="ac-meta">${eps}${score ? ' · ' + score : ''}${inLib ? ' · <span style="color:var(--green)">✓ Dans ta liste</span>' : ''}</span>
+          </div>
+        `;
+        div.addEventListener('click', () => {
+          closeAC();
+          searchInput.value = '';
+          openModal({
+            title,
+            genre: (a.genres || []).map(g => g.name).join(', '),
+            totalEpisodes: a.episodes || null,
+            epDuration: parseDuration(a.duration),
+            image: a.images?.jpg?.image_url || '',
+            synopsis: a.synopsis || '',
+          });
+        });
+        acDropdown.appendChild(div);
+      });
+
+      // Option manuelle
+      const manual = document.createElement('div');
+      manual.className = 'ac-item ac-manual';
+      manual.innerHTML = `<span style="font-size:1.2em">✏️</span> Ajouter "<strong>${q}</strong>" manuellement`;
+      manual.addEventListener('click', () => {
+        closeAC();
+        searchInput.value = '';
+        openModal({ title: q });
+      });
+      acDropdown.appendChild(manual);
+      acDropdown.classList.add('open');
+    }
+
+    function closeAC() {
+      acDropdown.classList.remove('open');
+      acDropdown.innerHTML = '';
+    }
+
+    function highlight(text, q) {
+      const idx = text.toLowerCase().indexOf(q.toLowerCase());
+      if (idx === -1) return text;
+      return text.slice(0, idx)
+        + `<mark>${text.slice(idx, idx + q.length)}</mark>`
+        + text.slice(idx + q.length);
+    }
+
+    function parseDuration(str) {
+      if (!str) return 23;
+      const m = str.match(/(\d+)\s*min/);
+      return m ? +m[1] : 23;
+    }
+
+    // ─── Modal ajout/édition ──────────────────────────────────────────────────
+    function openModal(prefill = {}, existingId = null) {
+      editingId = existingId;
+      modalTitle.textContent = existingId ? 'Modifier l\'anime' : 'Ajouter un anime';
+      document.getElementById('f-title').value    = prefill.title || '';
+      document.getElementById('f-status').value   = prefill.status || 'en-cours';
+      document.getElementById('f-rating').value   = prefill.rating || '0';
+      document.getElementById('f-genre').value    = prefill.genre || '';
+      document.getElementById('f-total-ep').value = prefill.totalEpisodes || '';
+      document.getElementById('f-ep-dur').value   = prefill.epDuration || 23;
+      document.getElementById('f-season').value   = prefill.currentSeason || '';
+      document.getElementById('f-episode').value  = prefill.currentEpisode || '';
+      document.getElementById('f-comment').value  = prefill.comment || '';
+      document.getElementById('f-image').value    = prefill.image || '';
+      document.getElementById('f-synopsis').value = prefill.synopsis || '';
+      updateStars(+(prefill.rating || 0));
+      document.getElementById('modal-delete').style.display = existingId ? 'block' : 'none';
+      modal.classList.add('open');
+      setTimeout(() => document.getElementById('f-title').focus(), 100);
+    }
+
+    document.getElementById('modal-close').addEventListener('click', () => modal.classList.remove('open'));
+    modal.addEventListener('click', e => { if (e.target === modal) modal.classList.remove('open'); });
+
+    // Étoiles
+    const starsContainer = document.getElementById('stars-input');
+    function updateStars(val) {
+      document.getElementById('f-rating').value = val;
+      starsContainer.querySelectorAll('.star').forEach((s, i) => {
+        s.classList.toggle('filled', i < val);
+      });
+    }
+    starsContainer.querySelectorAll('.star').forEach((s, i) => {
+      s.addEventListener('click', () => updateStars(i + 1 === +document.getElementById('f-rating').value ? 0 : i + 1));
+      s.addEventListener('mouseenter', () => starsContainer.querySelectorAll('.star').forEach((x, j) => x.classList.toggle('hovered', j <= i)));
+      s.addEventListener('mouseleave', () => starsContainer.querySelectorAll('.star').forEach(x => x.classList.remove('hovered')));
+    });
+
+    // Sauvegarde
+    document.getElementById('modal-form').addEventListener('submit', async e => {
+      e.preventDefault();
+      const data = {
+        id: editingId,
+        title:          document.getElementById('f-title').value.trim(),
+        status:         document.getElementById('f-status').value,
+        rating:         +document.getElementById('f-rating').value,
+        genre:          document.getElementById('f-genre').value.trim(),
+        totalEpisodes:  +document.getElementById('f-total-ep').value || null,
+        epDuration:     +document.getElementById('f-ep-dur').value || 23,
+        currentSeason:  +document.getElementById('f-season').value || null,
+        currentEpisode: +document.getElementById('f-episode').value || null,
+        comment:        document.getElementById('f-comment').value.trim(),
+        image:          document.getElementById('f-image').value.trim(),
+        synopsis:       document.getElementById('f-synopsis').value.trim(),
+        addedAt:        animes.find(a => a.id === editingId)?.addedAt || Date.now(),
+      };
+      if (!data.title) return;
+      await saveAnime(data);
+      modal.classList.remove('open');
+    });
+
+    document.getElementById('modal-delete').addEventListener('click', async () => {
+      if (!editingId) return;
+      if (!confirm('Supprimer cet anime ?')) return;
+      await deleteAnime(editingId);
+      modal.classList.remove('open');
+    });
+
+    // Exposer editingId pour le script non-module
+    Object.defineProperty(window, '_editingId', { get: () => editingId });
+
+    // ─── Rendu de la grille ───────────────────────────────────────────────────
+    const STATUS_LABELS = {
+      'en-cours': { label: 'En cours', color: 'var(--teal)' },
+      'termine':  { label: 'Terminé',  color: 'var(--green)' },
+      'pause':    { label: 'En pause', color: 'var(--gold)' },
+      'planifie': { label: 'Planifié', color: 'var(--fg3)' },
+      'abandonne':{ label: 'Abandonné',color: 'var(--red)' },
+    };
+
+    function renderGrid() {
+      let list = [...animes];
+
+      // Filtre
+      if (filterStatus !== 'all') list = list.filter(a => a.status === filterStatus);
+
+      // Recherche locale
+      const q = searchInput.value.trim().toLowerCase();
+      if (q.length >= 1 && acDropdown.children.length === 0) {
+        // Filtre la liste si pas d'autocomplete ouvert
+      }
+
+      // Tri
+      if (sortBy === 'alpha')   list.sort((a, b) => a.title.localeCompare(b.title));
+      if (sortBy === 'rating')  list.sort((a, b) => (b.rating || 0) - (a.rating || 0));
+      if (sortBy === 'recent')  list.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+
+      emptyState.hidden = list.length > 0;
+      animeGrid.innerHTML = '';
+
+      list.forEach(a => {
+        const st = STATUS_LABELS[a.status] || STATUS_LABELS['en-cours'];
+        const stars = '★'.repeat(a.rating || 0) + '☆'.repeat(5 - (a.rating || 0));
+        const progress = a.totalEpisodes && a.currentEpisode
+          ? Math.round((a.currentEpisode / a.totalEpisodes) * 100)
+          : null;
+        const epInfo = a.currentEpisode
+          ? `S${a.currentSeason || 1} E${a.currentEpisode}${a.totalEpisodes ? '/' + a.totalEpisodes : ''}`
+          : a.totalEpisodes ? `${a.totalEpisodes} ép.` : '';
+
+        const card = document.createElement('div');
+        card.className = 'anime-card';
+        card.innerHTML = `
+          <div class="card-cover" style="${a.image ? `background-image:url('${a.image}')` : ''}">
+            ${!a.image ? `<div class="card-cover-placeholder">${a.title.slice(0,2).toUpperCase()}</div>` : ''}
+            <span class="status-badge" style="background:${st.color}20;color:${st.color};border-color:${st.color}40">${st.label}</span>
+          </div>
+          <div class="card-body">
+            <div class="card-title">${a.title}</div>
+            ${a.genre ? `<div class="card-genre">${a.genre.split(',').slice(0,2).join(' · ')}</div>` : ''}
+            <div class="card-rating">${a.rating ? stars : '<span style="color:var(--fg3)">Non noté</span>'}</div>
+            ${epInfo ? `<div class="card-ep">${epInfo}</div>` : ''}
+            ${progress !== null ? `
+              <div class="progress-bar"><div class="progress-fill" style="width:${progress}%"></div></div>
+            ` : ''}
+            ${a.comment ? `<div class="card-comment">"${a.comment}"</div>` : ''}
+          </div>
+        `;
+        card.addEventListener('click', () => openModal(a, a.id));
+        animeGrid.appendChild(card);
+      });
+    }
+
+    // ─── Stats ────────────────────────────────────────────────────────────────
+    function renderStats() {
+      const total = animes.length;
+      const termine = animes.filter(a => a.status === 'termine').length;
+      const enCours = animes.filter(a => a.status === 'en-cours').length;
+
+      // Épisodes vus
+      let totalEp = 0;
+      animes.forEach(a => {
+        if (a.status === 'termine' && a.totalEpisodes) totalEp += a.totalEpisodes;
+        else if (a.currentEpisode) totalEp += a.currentEpisode;
+      });
+
+      // Minutes vues
+      let totalMin = 0;
+      animes.forEach(a => {
+        const ep = a.status === 'termine' ? (a.totalEpisodes || 0) : (a.currentEpisode || 0);
+        totalMin += ep * (a.epDuration || 23);
+      });
+
+      const jours = Math.floor(totalMin / 1440);
+      const heures = Math.floor((totalMin % 1440) / 60);
+      const mins = totalMin % 60;
+
+      // Note moyenne
+      const noted = animes.filter(a => a.rating > 0);
+      const avgRating = noted.length ? (noted.reduce((s, a) => s + a.rating, 0) / noted.length).toFixed(1) : '—';
+
+      // Top genres
+      const genreCounts = {};
+      animes.forEach(a => {
+        if (!a.genre) return;
+        a.genre.split(',').forEach(g => {
+          const key = g.trim();
+          genreCounts[key] = (genreCounts[key] || 0) + 1;
+        });
+      });
+      const topGenres = Object.entries(genreCounts)
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, 5);
+
+      // Répartition statuts
+      const statusDist = Object.entries(STATUS_LABELS).map(([k, v]) => ({
+        label: v.label,
+        color: v.color,
+        count: animes.filter(a => a.status === k).length,
+      })).filter(x => x.count > 0);
+
+      document.getElementById('stats-section').innerHTML = `
+        <div class="stats-grid">
+          <div class="stat-card">
+            <div class="stat-icon">📺</div>
+            <div class="stat-value">${total}</div>
+            <div class="stat-label">Animes dans la liste</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-icon">✅</div>
+            <div class="stat-value">${termine}</div>
+            <div class="stat-label">Terminés</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-icon">▶️</div>
+            <div class="stat-value">${enCours}</div>
+            <div class="stat-label">En cours</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-icon">🎬</div>
+            <div class="stat-value">${totalEp.toLocaleString('fr')}</div>
+            <div class="stat-label">Épisodes vus</div>
+          </div>
+          <div class="stat-card accent">
+            <div class="stat-icon">⏱️</div>
+            <div class="stat-value">${jours > 0 ? jours + 'j ' : ''}${heures}h ${mins}min</div>
+            <div class="stat-label">Temps total regardé</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-icon">⭐</div>
+            <div class="stat-value">${avgRating}</div>
+            <div class="stat-label">Note moyenne</div>
+          </div>
+        </div>
+
+        ${topGenres.length ? `
+        <div class="stats-block">
+          <h3 class="stats-heading">Genres favoris</h3>
+          <div class="genre-bars">
+            ${topGenres.map(([g, c]) => `
+              <div class="genre-bar-row">
+                <span class="genre-bar-label">${g}</span>
+                <div class="genre-bar-track">
+                  <div class="genre-bar-fill" style="width:${Math.round(c/topGenres[0][1]*100)}%"></div>
+                </div>
+                <span class="genre-bar-count">${c}</span>
+              </div>
+            `).join('')}
+          </div>
+        </div>` : ''}
+
+        ${statusDist.length ? `
+        <div class="stats-block">
+          <h3 class="stats-heading">Répartition</h3>
+          <div class="status-dist">
+            ${statusDist.map(s => `
+              <div class="dist-row">
+                <span class="dist-dot" style="background:${s.color}"></span>
+                <span class="dist-label">${s.label}</span>
+                <span class="dist-count">${s.count}</span>
+                <div class="dist-bar-track">
+                  <div class="dist-bar-fill" style="width:${Math.round(s.count/total*100)}%;background:${s.color}"></div>
+                </div>
+              </div>
+            `).join('')}
+          </div>
+        </div>` : ''}
+      `;
+    }
+
+    // FAB bouton ajout rapide
+    document.getElementById('fab').addEventListener('click', () => openModal());
+
+    // Bouton thème
+    document.getElementById('theme-toggle').addEventListener('click', () => {
+      const html = document.documentElement;
+      html.dataset.theme = html.dataset.theme === 'light' ? 'dark' : 'light';
+    });
+  </script>
+
+<style>
+/* ─── Reset & tokens ──────────────────────────────────────────────────────── */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+html { font-size: 15px; }
+body {
+  font-family: 'Nunito', system-ui, sans-serif;
+  background: var(--bg);
+  color: var(--fg);
+  min-height: 100dvh;
+  line-height: 1.6;
+}
+
+:root {
+  --bg:       #0d0f1a;
+  --bg2:      #151828;
+  --bg3:      #1e2236;
+  --surface:  #252944;
+  --border:   #2e3355;
+  --fg:       #e8eaf6;
+  --fg2:      #9ba3c8;
+  --fg3:      #5c6494;
+  --accent:   #7c6ef5;
+  --accent2:  #a78bfa;
+  --pink:     #f472b6;
+  --teal:     #2dd4bf;
+  --gold:     #fbbf24;
+  --red:      #f87171;
+  --green:    #34d399;
+  --radius:   12px;
+  color-scheme: dark;
+}
+:root[data-theme="light"] {
+  --bg:       #f0f2ff;
+  --bg2:      #ffffff;
+  --bg3:      #e8eafc;
+  --surface:  #ffffff;
+  --border:   #d1d5f0;
+  --fg:       #1a1d3a;
+  --fg2:      #4a4f7a;
+  --fg3:      #8890b8;
+  --accent:   #6c5ce7;
+  --accent2:  #7c6ef5;
+  color-scheme: light;
+}
+
+/* ─── Topbar ──────────────────────────────────────────────────────────────── */
+.topbar {
+  position: sticky; top: 0; z-index: 50;
+  background: var(--bg2);
+  border-bottom: 1px solid var(--border);
+  padding: 0 16px;
+  height: 58px;
+  display: flex; align-items: center; gap: 12px;
+}
+.logo {
+  font-weight: 900; font-size: 1.15rem; letter-spacing: -.5px;
+  background: linear-gradient(135deg, var(--accent2), var(--pink));
+  -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+  background-clip: text; white-space: nowrap;
+}
+.topbar-search { flex: 1; position: relative; max-width: 420px; }
+.topbar-search input {
+  width: 100%; background: var(--bg3); border: 1.5px solid var(--border);
+  color: var(--fg); border-radius: 30px; padding: 8px 16px;
+  font-family: inherit; font-size: .95rem; outline: none;
+  transition: border-color .2s;
+}
+.topbar-search input:focus { border-color: var(--accent); }
+.topbar-right { display: flex; align-items: center; gap: 10px; margin-left: auto; }
+#user-avatar { width: 32px; height: 32px; border-radius: 50%; object-fit: cover; border: 2px solid var(--accent); }
+#user-name { font-weight: 700; color: var(--fg2); font-size: .9rem; }
+.btn-icon {
+  background: var(--bg3); border: 1px solid var(--border); color: var(--fg2);
+  width: 34px; height: 34px; border-radius: 50%; cursor: pointer;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 1rem; transition: background .15s;
+}
+.btn-icon:hover { background: var(--surface); }
+
+/* ─── Autocomplete ────────────────────────────────────────────────────────── */
+#ac-dropdown {
+  display: none; position: absolute; top: calc(100% + 6px); left: 0; right: 0;
+  background: var(--bg2); border: 1.5px solid var(--border); border-radius: var(--radius);
+  box-shadow: 0 8px 32px rgba(0,0,0,.4); z-index: 200; overflow: hidden; max-height: 420px; overflow-y: auto;
+}
+#ac-dropdown.open { display: block; }
+.ac-item {
+  display: flex; align-items: center; gap: 10px;
+  padding: 10px 14px; cursor: pointer; transition: background .12s;
+}
+.ac-item:hover, .ac-item.focused { background: var(--bg3); }
+.ac-item.in-lib { opacity: .7; }
+.ac-thumb { width: 36px; height: 50px; object-fit: cover; border-radius: 4px; flex-shrink: 0; }
+.ac-thumb-placeholder { width: 36px; height: 50px; border-radius: 4px; background: var(--surface); flex-shrink: 0; }
+.ac-info { display: flex; flex-direction: column; min-width: 0; }
+.ac-title { font-weight: 700; font-size: .95rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.ac-title mark { background: transparent; color: var(--accent2); font-style: italic; }
+.ac-meta { font-size: .8rem; color: var(--fg3); }
+.ac-manual { color: var(--fg2); font-size: .9rem; border-top: 1px solid var(--border); }
+.ac-loading { padding: 14px 16px; color: var(--fg3); display: flex; align-items: center; gap: 10px; }
+.spinner {
+  width: 16px; height: 16px; border: 2px solid var(--border); border-top-color: var(--accent);
+  border-radius: 50%; animation: spin .7s linear infinite; flex-shrink: 0;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* ─── Tabs & toolbar ──────────────────────────────────────────────────────── */
+.tabs {
+  background: var(--bg2); border-bottom: 1px solid var(--border);
+  display: flex; padding: 0 16px;
+}
+.tab-btn {
+  padding: 10px 20px; background: none; border: none; color: var(--fg3);
+  font-family: inherit; font-size: .95rem; font-weight: 700; cursor: pointer;
+  border-bottom: 2.5px solid transparent; transition: color .15s, border-color .15s;
+}
+.tab-btn.active { color: var(--accent2); border-color: var(--accent2); }
+.toolbar {
+  padding: 12px 16px; display: flex; gap: 10px; flex-wrap: wrap; align-items: center;
+}
+.toolbar select {
+  background: var(--bg3); border: 1px solid var(--border); color: var(--fg);
+  border-radius: 20px; padding: 6px 12px; font-family: inherit; font-size: .85rem;
+  cursor: pointer; outline: none;
+}
+
+/* ─── Grille d'animes ─────────────────────────────────────────────────────── */
+.anime-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(170px, 1fr));
+  gap: 16px; padding: 0 16px 100px;
+}
+.anime-card {
+  background: var(--bg2); border: 1px solid var(--border); border-radius: var(--radius);
+  overflow: hidden; cursor: pointer; transition: transform .18s, box-shadow .18s;
+}
+.anime-card:hover { transform: translateY(-3px); box-shadow: 0 8px 24px rgba(0,0,0,.4); }
+.card-cover {
+  height: 200px; background: var(--bg3) center/cover no-repeat;
+  position: relative; display: flex; align-items: center; justify-content: center;
+}
+.card-cover-placeholder {
+  font-size: 2.5rem; font-weight: 900; color: var(--accent2); opacity: .3;
+}
+.status-badge {
+  position: absolute; bottom: 8px; left: 8px;
+  font-size: .7rem; font-weight: 800; padding: 2px 8px;
+  border-radius: 20px; border: 1px solid; letter-spacing: .3px;
+}
+.card-body { padding: 10px 12px; display: flex; flex-direction: column; gap: 4px; }
+.card-title { font-weight: 800; font-size: .9rem; line-height: 1.3; }
+.card-genre { font-size: .75rem; color: var(--fg3); }
+.card-rating { color: var(--gold); font-size: .85rem; letter-spacing: 1px; }
+.card-ep { font-size: .75rem; color: var(--teal); font-weight: 700; }
+.progress-bar { height: 3px; background: var(--bg3); border-radius: 2px; margin-top: 2px; }
+.progress-fill { height: 100%; background: var(--accent); border-radius: 2px; }
+.card-comment { font-size: .75rem; color: var(--fg2); font-style: italic; margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+/* ─── Empty state ─────────────────────────────────────────────────────────── */
+#empty-state {
+  text-align: center; padding: 80px 16px; color: var(--fg3);
+}
+#empty-state .empty-emoji { font-size: 4rem; margin-bottom: 16px; }
+#empty-state p { font-size: 1.1rem; }
+
+/* ─── Modal ───────────────────────────────────────────────────────────────── */
+#modal {
+  display: none; position: fixed; inset: 0; z-index: 300;
+  background: rgba(0,0,0,.6); backdrop-filter: blur(4px);
+  align-items: center; justify-content: center; padding: 16px;
+}
+#modal.open { display: flex; }
+.modal-box {
+  background: var(--bg2); border: 1px solid var(--border); border-radius: 16px;
+  width: 100%; max-width: 500px; max-height: 90dvh; overflow-y: auto;
+  padding: 24px; display: flex; flex-direction: column; gap: 16px;
+}
+.modal-header { display: flex; align-items: center; justify-content: space-between; }
+.modal-header h2 { font-size: 1.2rem; font-weight: 900; }
+.modal-close {
+  background: var(--bg3); border: 1px solid var(--border); color: var(--fg2);
+  width: 32px; height: 32px; border-radius: 50%; cursor: pointer; font-size: 1.1rem;
+  display: flex; align-items: center; justify-content: center;
+}
+.form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.form-full { grid-column: 1/-1; }
+.form-group { display: flex; flex-direction: column; gap: 4px; }
+.form-group label { font-size: .8rem; font-weight: 700; color: var(--fg2); text-transform: uppercase; letter-spacing: .5px; }
+.form-group input, .form-group select, .form-group textarea {
+  background: var(--bg3); border: 1.5px solid var(--border); color: var(--fg);
+  border-radius: 8px; padding: 8px 12px; font-family: inherit; font-size: .95rem;
+  outline: none; transition: border-color .15s;
+}
+.form-group input:focus, .form-group select:focus, .form-group textarea:focus { border-color: var(--accent); }
+.form-group textarea { resize: vertical; min-height: 72px; }
+.stars-row { display: flex; gap: 6px; margin-top: 4px; }
+.star {
+  font-size: 1.6rem; cursor: pointer; color: var(--fg3);
+  transition: color .1s, transform .1s;
+  user-select: none;
+}
+.star.filled { color: var(--gold); }
+.star.hovered { color: var(--gold); transform: scale(1.2); }
+.modal-actions { display: flex; gap: 10px; margin-top: 4px; }
+.btn {
+  flex: 1; padding: 10px; border-radius: 10px; border: none; font-family: inherit;
+  font-size: .95rem; font-weight: 800; cursor: pointer; transition: opacity .15s;
+}
+.btn:hover { opacity: .85; }
+.btn-primary { background: var(--accent); color: #fff; }
+.btn-danger { background: var(--red); color: #fff; }
+.btn-ghost { background: var(--bg3); color: var(--fg2); border: 1px solid var(--border); flex: none; padding: 10px 18px; }
+
+/* ─── Stats ───────────────────────────────────────────────────────────────── */
+.stats-grid {
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+  gap: 12px; padding: 16px;
+}
+.stat-card {
+  background: var(--bg2); border: 1px solid var(--border); border-radius: var(--radius);
+  padding: 18px 14px; text-align: center;
+}
+.stat-card.accent { border-color: var(--accent); }
+.stat-icon { font-size: 1.6rem; margin-bottom: 6px; }
+.stat-value { font-size: 1.5rem; font-weight: 900; color: var(--accent2); }
+.stat-label { font-size: .8rem; color: var(--fg3); margin-top: 2px; }
+.stats-block { padding: 0 16px 24px; }
+.stats-heading { font-size: 1rem; font-weight: 800; color: var(--fg2); margin-bottom: 12px; }
+.genre-bars, .status-dist { display: flex; flex-direction: column; gap: 8px; }
+.genre-bar-row, .dist-row { display: flex; align-items: center; gap: 10px; }
+.genre-bar-label, .dist-label { font-size: .85rem; min-width: 110px; font-weight: 600; }
+.genre-bar-track, .dist-bar-track { flex: 1; height: 6px; background: var(--bg3); border-radius: 4px; }
+.genre-bar-fill { height: 100%; background: var(--accent); border-radius: 4px; transition: width .4s; }
+.dist-bar-fill { height: 100%; border-radius: 4px; }
+.genre-bar-count, .dist-count { font-size: .8rem; color: var(--fg3); min-width: 24px; text-align: right; }
+.dist-dot { width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0; }
+
+/* ─── FAB ─────────────────────────────────────────────────────────────────── */
+#fab {
+  position: fixed; bottom: 24px; right: 20px; z-index: 100;
+  width: 56px; height: 56px; border-radius: 50%;
+  background: linear-gradient(135deg, var(--accent), var(--pink));
+  color: #fff; font-size: 1.8rem; font-weight: 300; border: none; cursor: pointer;
+  box-shadow: 0 4px 20px rgba(124,110,245,.5);
+  display: flex; align-items: center; justify-content: center;
+  transition: transform .15s, box-shadow .15s;
+}
+#fab:hover { transform: scale(1.08); box-shadow: 0 6px 28px rgba(124,110,245,.7); }
+
+/* ─── Login screen ────────────────────────────────────────────────────────── */
+#login-screen {
+  min-height: 100dvh; display: flex; align-items: center; justify-content: center;
+  flex-direction: column; gap: 24px; padding: 24px; text-align: center;
+}
+.login-logo { font-size: 3rem; font-weight: 900;
+  background: linear-gradient(135deg, var(--accent2), var(--pink));
+  -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text;
+}
+.login-sub { color: var(--fg2); font-size: 1.05rem; max-width: 280px; }
+.btn-google {
+  display: flex; align-items: center; gap: 12px;
+  background: #fff; color: #333; border: none; border-radius: 30px;
+  padding: 12px 28px; font-size: 1rem; font-weight: 700; cursor: pointer;
+  box-shadow: 0 2px 12px rgba(0,0,0,.2); transition: box-shadow .15s;
+}
+.btn-google:hover { box-shadow: 0 4px 20px rgba(0,0,0,.3); }
+.btn-google svg { width: 20px; height: 20px; }
+
+/* ─── Responsive ──────────────────────────────────────────────────────────── */
+@media (max-width: 500px) {
+  .anime-grid { grid-template-columns: repeat(2, 1fr); gap: 10px; padding: 0 10px 100px; }
+  .form-grid { grid-template-columns: 1fr; }
+  #user-name { display: none; }
+}
+</style>
+</head>
+<body>
+
+<!-- LOGIN -->
+<div id="login-screen">
+  <div class="login-logo">🎌 Anime Tracker</div>
+  <p class="login-sub">Ta liste personnelle d'animes, synchronisée sur tous tes appareils.</p>
+  <button class="btn-google" id="login-btn">
+    <svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+      <path d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z" fill="#4285F4"/>
+      <path d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z" fill="#34A853"/>
+      <path d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z" fill="#FBBC05"/>
+      <path d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z" fill="#EA4335"/>
+    </svg>
+    Connexion avec Google
+  </button>
+</div>
+
+<!-- APP -->
+<div id="app-screen" hidden>
+  <!-- Topbar -->
+  <div class="topbar">
+    <div class="logo">🎌 Anime Tracker</div>
+    <div class="topbar-search">
+      <input id="search-input" type="search" placeholder="Rechercher un anime…" autocomplete="off">
+      <div id="ac-dropdown"></div>
+    </div>
+    <div class="topbar-right">
+      <img id="user-avatar" src="" alt="" hidden>
+      <span id="user-name"></span>
+      <button class="btn-icon" id="theme-toggle" title="Thème">◐</button>
+      <button class="btn-icon" id="logout-btn" title="Déconnexion">⎋</button>
+    </div>
+  </div>
+
+  <!-- Tabs -->
+  <div class="tabs">
+    <button class="tab-btn active" data-tab="liste">📋 Ma liste</button>
+    <button class="tab-btn" data-tab="stats">📊 Statistiques</button>
+  </div>
+
+  <!-- Liste -->
+  <div id="liste-section">
+    <div class="toolbar">
+      <select id="filter-status">
+        <option value="all">Tous les statuts</option>
+        <option value="en-cours">En cours</option>
+        <option value="termine">Terminés</option>
+        <option value="pause">En pause</option>
+        <option value="planifie">Planifiés</option>
+        <option value="abandonne">Abandonnés</option>
+      </select>
+      <select id="sort-by">
+        <option value="recent">Récemment modifié</option>
+        <option value="alpha">A → Z</option>
+        <option value="rating">Meilleures notes</option>
+      </select>
+    </div>
+    <div id="empty-state">
+      <div class="empty-emoji">🎌</div>
+      <p>Aucun anime pour l'instant.<br>Utilise la barre de recherche pour en ajouter !</p>
+    </div>
+    <div id="anime-grid" class="anime-grid"></div>
+  </div>
+
+  <!-- Stats -->
+  <div id="stats-section" hidden></div>
+
+  <!-- FAB -->
+  <button id="fab" title="Ajouter manuellement">+</button>
+</div>
+
+<!-- Modal -->
+<div id="modal">
+  <div class="modal-box">
+    <div class="modal-header">
+      <h2 id="modal-title">Ajouter un anime</h2>
+      <button class="modal-close" id="modal-close">✕</button>
+    </div>
+    <form id="modal-form">
+      <div class="form-grid">
+        <div class="form-group form-full">
+          <label>Titre *</label>
+          <input id="f-title" type="text" required placeholder="Nom de l'anime">
+        </div>
+        <div class="form-group form-full">
+          <label>Note</label>
+          <div id="stars-input" class="stars-row">
+            <span class="star" title="1">★</span>
+            <span class="star" title="2">★</span>
+            <span class="star" title="3">★</span>
+            <span class="star" title="4">★</span>
+            <span class="star" title="5">★</span>
+          </div>
+          <input id="f-rating" type="hidden" value="0">
+        </div>
+        <div class="form-group">
+          <label>Statut</label>
+          <select id="f-status">
+            <option value="en-cours">▶ En cours</option>
+            <option value="termine">✅ Terminé</option>
+            <option value="pause">⏸ En pause</option>
+            <option value="planifie">📌 Planifié</option>
+            <option value="abandonne">✗ Abandonné</option>
+          </select>
+        </div>
+        <div class="form-group">
+          <label>Genre</label>
+          <input id="f-genre" type="text" placeholder="Action, Drame…">
+        </div>
+        <div class="form-group">
+          <label>Saison actuelle</label>
+          <input id="f-season" type="number" min="1" placeholder="1">
+        </div>
+        <div class="form-group">
+          <label>Épisode actuel</label>
+          <input id="f-episode" type="number" min="0" placeholder="12">
+        </div>
+        <div class="form-group">
+          <label>Nb d'épisodes total</label>
+          <input id="f-total-ep" type="number" min="1" placeholder="24">
+        </div>
+        <div class="form-group">
+          <label>Durée par ép. (min)</label>
+          <input id="f-ep-dur" type="number" min="1" value="23">
+        </div>
+        <div class="form-group form-full">
+          <label>Commentaire</label>
+          <textarea id="f-comment" placeholder="Ton avis, ce que tu as aimé…"></textarea>
+        </div>
+        <input id="f-image" type="hidden">
+        <input id="f-synopsis" type="hidden">
+      </div>
+      <div class="modal-actions">
+        <button type="button" class="btn btn-danger" id="modal-delete" style="display:none">🗑 Supprimer</button>
+        <button type="submit" class="btn btn-primary">💾 Sauvegarder</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<script>
+  // Service Worker (PWA)
+  if ('serviceWorker' in navigator) {
+    navigator.serviceWorker.register('/sw.js').catch(() => {});
+  }
+</script>
+</body>
+</html>
